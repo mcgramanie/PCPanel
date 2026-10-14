@@ -4,7 +4,11 @@ package com.getpcpanel.integration.volume.platform.osx;
 interface Tap extends AutoCloseable {
     void setGain(float gain);
 
+    float gain();
+
     void setMuted(boolean muted);
+
+    boolean muted();
 
     @Override
     void close();

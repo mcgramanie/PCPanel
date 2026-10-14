@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.IOException;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -18,34 +19,51 @@ import java.util.function.BooleanSupplier;
 
 import javax.annotation.Nullable;
 
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import com.getpcpanel.integration.volume.platform.MuteType;
+import com.getpcpanel.util.os.FakeProcess;
 
 /**
  * The tap bookkeeping of {@link OsxProcessTapService} against a fake CoreAudio: taps follow the default output,
- * keep their volume and mute, and recover from a tap that cannot be created. Runs on every OS.
+ * keep their volume and mute, and recover from a tap that cannot be created. Runs on every OS. The two "apps" are
+ * real, idle child processes, because taps are scoped to process lifetimes.
  */
 class OsxProcessTapServiceTest {
     private static final int SPEAKERS = 1;
     private static final int HEADPHONES = 2;
     private static final int MONITOR = 3;
-    private static final int FIREFOX = 101;
-    private static final int MUSIC = 202;
+    private Process firefoxProcess;
+    private Process musicProcess;
+    private int firefox;
+    private int music;
 
     private FakeCoreAudio coreAudio;
     private FakeTaps factory;
-    private Set<Integer> alive;
     private OsxProcessTapService service;
+
+    @BeforeAll
+    void startApps() throws IOException {
+        firefoxProcess = new ProcessBuilder(FakeProcess.command("idle")).start();
+        musicProcess = new ProcessBuilder(FakeProcess.command("idle")).start();
+        firefox = (int) firefoxProcess.pid();
+        music = (int) musicProcess.pid();
+    }
+
+    @AfterAll
+    void stopApps() {
+        firefoxProcess.destroyForcibly();
+        musicProcess.destroyForcibly();
+    }
 
     @BeforeEach
     void setUp() {
         coreAudio = new FakeCoreAudio();
         factory = new FakeTaps();
-        alive = ConcurrentHashMap.newKeySet();
-        alive.addAll(List.of(FIREFOX, MUSIC));
         service = service(Duration.ofMillis(20));
     }
 
@@ -56,89 +74,89 @@ class OsxProcessTapServiceTest {
     }
 
     private OsxProcessTapService service(Duration retryDelay) {
-        return new OsxProcessTapService(coreAudio, factory, alive::contains, true, retryDelay);
+        return new OsxProcessTapService(coreAudio, factory, true, retryDelay);
     }
 
     @Test
     void movesEveryTapToTheNewDefaultOutputKeepingVolumeAndMute() {
-        service.setVolume(FIREFOX, 0.3f);
-        service.setVolume(MUSIC, 0.6f);
-        service.mute(MUSIC, MuteType.mute);
+        service.setVolume(firefox, 0.3f);
+        service.setVolume(music, 0.6f);
+        service.mute(music, MuteType.mute);
 
         coreAudio.defaultOutput = HEADPHONES;
         assertTrue(service.migrateToDefaultOutput());
 
-        var firefox = factory.live(FIREFOX);
-        assertEquals(uid(HEADPHONES), firefox.uid);
-        assertEquals(0.3f, firefox.gain);
-        assertFalse(firefox.muted);
-        var music = factory.live(MUSIC);
-        assertEquals(uid(HEADPHONES), music.uid);
-        assertEquals(0.6f, music.gain);
-        assertTrue(music.createdMuted, "the moved tap is muted before it renders");
+        var firefoxTap = factory.live(firefox);
+        assertEquals(uid(HEADPHONES), firefoxTap.uid);
+        assertEquals(0.3f, firefoxTap.gain);
+        assertFalse(firefoxTap.muted);
+        var musicTap = factory.live(music);
+        assertEquals(uid(HEADPHONES), musicTap.uid);
+        assertEquals(0.6f, musicTap.gain);
+        assertTrue(musicTap.createdMuted, "the moved tap is muted before it renders");
         assertEquals(2, factory.liveCount(), "the taps on the speakers are closed");
     }
 
     @Test
     void aMutedAppIsTappedMutedFromTheStart() {
-        service.mute(FIREFOX, MuteType.mute);
+        service.mute(firefox, MuteType.mute);
 
-        var tap = factory.live(FIREFOX);
+        var tap = factory.live(firefox);
         assertTrue(tap.createdMuted, "muted before the tap renders");
         assertEquals(1f, tap.gain);
     }
 
     @Test
     void leavesTapsAloneWhileTheDefaultOutputStays() {
-        service.setVolume(FIREFOX, 0.3f);
+        service.setVolume(firefox, 0.3f);
 
         assertTrue(service.migrateToDefaultOutput());
 
         assertEquals(1, factory.created.size());
-        assertEquals(uid(SPEAKERS), factory.live(FIREFOX).uid);
+        assertEquals(uid(SPEAKERS), factory.live(firefox).uid);
     }
 
     @Test
     void keepsTapsWhileTheDefaultOutputCannotBeRead() {
-        service.setVolume(FIREFOX, 0.3f);
+        service.setVolume(firefox, 0.3f);
 
         coreAudio.defaultOutput = 0;
 
         assertFalse(service.migrateToDefaultOutput(), "not settled, so it is retried");
         assertEquals(1, factory.created.size());
-        assertEquals(uid(SPEAKERS), factory.live(FIREFOX).uid);
+        assertEquals(uid(SPEAKERS), factory.live(firefox).uid);
     }
 
     @Test
     void movesOnceTheDefaultOutputCanBeReadAgain() {
-        service.setVolume(FIREFOX, 0.3f);
+        service.setVolume(firefox, 0.3f);
         coreAudio.defaultOutput = 0;
         service.defaultOutputChanged();
 
         coreAudio.defaultOutput = HEADPHONES;
 
-        await(() -> factory.liveOn(FIREFOX, HEADPHONES));
-        assertEquals(0.3f, factory.live(FIREFOX).gain);
+        await(() -> factory.liveOn(firefox, HEADPHONES));
+        assertEquals(0.3f, factory.live(firefox).gain);
     }
 
     @Test
     void keepsTheOldTapWhileTheNewOutputCannotBeResolved() {
-        service.setVolume(FIREFOX, 0.3f);
+        service.setVolume(firefox, 0.3f);
         coreAudio.withoutUid.add(HEADPHONES);
         coreAudio.defaultOutput = HEADPHONES;
 
         assertFalse(service.migrateToDefaultOutput());
         assertEquals(1, factory.created.size(), "the old tap was never closed");
-        assertTrue(factory.liveOn(FIREFOX, SPEAKERS));
+        assertTrue(factory.liveOn(firefox, SPEAKERS));
 
         service.defaultOutputChanged();
         coreAudio.withoutUid.clear();
-        await(() -> factory.liveOn(FIREFOX, HEADPHONES));
+        await(() -> factory.liveOn(firefox, HEADPHONES));
     }
 
     @Test
     void notificationMovesTapsOffTheNotifyingThread() throws InterruptedException {
-        service.setVolume(FIREFOX, 0.3f);
+        service.setVolume(firefox, 0.3f);
         factory.block();
 
         coreAudio.defaultOutput = HEADPHONES;
@@ -147,14 +165,14 @@ class OsxProcessTapServiceTest {
         assertTrue(factory.entered.await(5, TimeUnit.SECONDS), "the move started");
         assertNotEquals(Thread.currentThread(), factory.blockedThread, "the move runs on its own thread");
         factory.release();
-        await(() -> factory.liveOn(FIREFOX, HEADPHONES));
-        assertEquals(0.3f, factory.live(FIREFOX).gain);
+        await(() -> factory.liveOn(firefox, HEADPHONES));
+        assertEquals(0.3f, factory.live(firefox).gain);
     }
 
     @Test
     void rapidSwitchingEndsOnTheLastOutputWithoutLeakingTaps() throws InterruptedException {
-        service.setVolume(FIREFOX, 0.3f);
-        service.setVolume(MUSIC, 0.6f);
+        service.setVolume(firefox, 0.3f);
+        service.setVolume(music, 0.6f);
         factory.block();
 
         coreAudio.defaultOutput = HEADPHONES;
@@ -166,7 +184,7 @@ class OsxProcessTapServiceTest {
         }
         factory.release();
 
-        await(() -> factory.liveOn(FIREFOX, MONITOR) && factory.liveOn(MUSIC, MONITOR));
+        await(() -> factory.liveOn(firefox, MONITOR) && factory.liveOn(music, MONITOR));
         assertEquals(2, factory.liveCount(), "one tap per app, every other one closed");
         // Initial taps, the move in progress (up to both apps) and a single follow-up for all changes queued meanwhile.
         assertTrue(factory.created.size() <= 6, "changes during a move are coalesced, created " + factory.created.size());
@@ -174,44 +192,43 @@ class OsxProcessTapServiceTest {
 
     @Test
     void aTapThatCannotBeMovedStaysOnItsPreviousOutputUntilARetryMovesIt() {
-        service.setVolume(MUSIC, 0.6f);
-        service.mute(MUSIC, MuteType.mute);
+        service.setVolume(music, 0.6f);
+        service.mute(music, MuteType.mute);
         factory.failingUids.add(uid(HEADPHONES));
 
         coreAudio.defaultOutput = HEADPHONES;
         assertFalse(service.migrateToDefaultOutput());
-        var kept = factory.live(MUSIC);
+        var kept = factory.live(music);
         assertEquals(uid(SPEAKERS), kept.uid, "back on the previous output");
         assertEquals(0.6f, kept.gain);
         assertTrue(kept.createdMuted, "still muted, never untapped for longer than the move");
 
         service.defaultOutputChanged();
         factory.failingUids.clear();
-        await(() -> factory.liveOn(MUSIC, HEADPHONES));
-        assertEquals(0.6f, factory.live(MUSIC).gain);
-        assertTrue(factory.live(MUSIC).muted);
+        await(() -> factory.liveOn(music, HEADPHONES));
+        assertEquals(0.6f, factory.live(music).gain);
+        assertTrue(factory.live(music).muted);
     }
 
     @Test
-    void anAppWithNoOutputToTapKeepsItsStateUntilARetryTapsItAgain() {
-        service.setVolume(MUSIC, 0.6f);
-        service.mute(MUSIC, MuteType.mute);
+    void anAppMuteThatCouldNotBeMovedAnywhereIsRestoredForItsOwner() {
+        service.muteApplication(music, List.of(music), MuteType.mute);
         factory.failingUids.addAll(List.of(uid(SPEAKERS), uid(HEADPHONES)));
 
         coreAudio.defaultOutput = HEADPHONES;
-        assertFalse(service.migrateToDefaultOutput());
-        assertEquals(0, factory.liveCount());
+        service.migrateToDefaultOutput();
+        assertEquals(0, factory.liveCount(), "untapped while neither output takes a tap");
 
-        service.defaultOutputChanged();
         factory.failingUids.clear();
-        await(() -> factory.liveOn(MUSIC, HEADPHONES));
-        assertEquals(0.6f, factory.live(MUSIC).gain);
-        assertTrue(factory.live(MUSIC).muted);
+        // What SndCtrlOsx does whenever it resolves the app's audio processes.
+        service.restoreApplicationMute(music, List.of(music));
+        assertTrue(factory.liveOn(music, HEADPHONES));
+        assertTrue(factory.live(music).createdMuted);
     }
 
     @Test
     void stopsRetryingAfterAFewAttemptsUntilTheNextChange() throws InterruptedException {
-        service.setVolume(FIREFOX, 0.3f);
+        service.setVolume(firefox, 0.3f);
         factory.failingUids.add(uid(HEADPHONES));
 
         coreAudio.defaultOutput = HEADPHONES;
@@ -219,20 +236,20 @@ class OsxProcessTapServiceTest {
         await(() -> factory.attempts(HEADPHONES) == 1 + OsxProcessTapService.MAX_RETRIES);
         Thread.sleep(300);
         assertEquals(1 + OsxProcessTapService.MAX_RETRIES, factory.attempts(HEADPHONES), "retries are bounded");
-        assertTrue(factory.liveOn(FIREFOX, SPEAKERS));
+        assertTrue(factory.liveOn(firefox, SPEAKERS));
 
         factory.failingUids.clear();
         coreAudio.defaultOutput = MONITOR;
         service.defaultOutputChanged();
-        await(() -> factory.liveOn(FIREFOX, MONITOR));
-        assertEquals(0.3f, factory.live(FIREFOX).gain);
+        await(() -> factory.liveOn(firefox, MONITOR));
+        assertEquals(0.3f, factory.live(firefox).gain);
     }
 
     @Test
     void aNewChangeReplacesTheRetriesOfThePreviousOne() throws InterruptedException {
         service.destroy();
         service = service(Duration.ofMillis(150));
-        service.setVolume(FIREFOX, 0.3f);
+        service.setVolume(firefox, 0.3f);
         factory.failingUids.addAll(List.of(uid(HEADPHONES), uid(MONITOR)));
 
         coreAudio.defaultOutput = HEADPHONES;
@@ -249,16 +266,16 @@ class OsxProcessTapServiceTest {
 
     @Test
     void usingTheControlRecoversATapThatCouldNotBeMoved() {
-        service.setVolume(FIREFOX, 0.3f);
-        service.mute(FIREFOX, MuteType.mute);
+        service.setVolume(firefox, 0.3f);
+        service.mute(firefox, MuteType.mute);
         factory.failingUids.add(uid(HEADPHONES));
         coreAudio.defaultOutput = HEADPHONES;
         service.migrateToDefaultOutput();
 
         factory.failingUids.clear();
-        service.setVolume(FIREFOX, 0.5f);
+        service.setVolume(firefox, 0.5f);
 
-        var tap = factory.live(FIREFOX);
+        var tap = factory.live(firefox);
         assertEquals(uid(HEADPHONES), tap.uid);
         assertEquals(0.5f, tap.gain);
         assertTrue(tap.createdMuted, "the mute survived the failed move");
@@ -266,12 +283,12 @@ class OsxProcessTapServiceTest {
 
     @Test
     void fullVolumeForgetsATapThatCouldNotBeMoved() {
-        service.setVolume(FIREFOX, 0.3f);
+        service.setVolume(firefox, 0.3f);
         factory.failingUids.addAll(List.of(uid(SPEAKERS), uid(HEADPHONES)));
         coreAudio.defaultOutput = HEADPHONES;
         service.migrateToDefaultOutput();
 
-        service.setVolume(FIREFOX, 1);
+        service.setVolume(firefox, 1);
         factory.failingUids.clear();
         coreAudio.defaultOutput = MONITOR;
 
@@ -281,53 +298,40 @@ class OsxProcessTapServiceTest {
     }
 
     @Test
-    void dropsTapsOfProcessesThatEnded() {
-        service.setVolume(FIREFOX, 0.3f);
-        service.setVolume(MUSIC, 0.6f);
-        alive.remove(MUSIC);
-
-        coreAudio.defaultOutput = HEADPHONES;
-        service.migrateToDefaultOutput();
-
-        assertEquals(1, factory.liveCount());
-        assertTrue(factory.liveOn(FIREFOX, HEADPHONES));
-    }
-
-    @Test
     void volumeAndMuteFollowTheNewOutputWithoutANotification() {
-        service.setVolume(FIREFOX, 0.3f);
+        service.setVolume(firefox, 0.3f);
         coreAudio.defaultOutput = HEADPHONES;
 
-        service.setVolume(FIREFOX, 0.4f);
+        service.setVolume(firefox, 0.4f);
 
-        assertTrue(factory.liveOn(FIREFOX, HEADPHONES));
-        assertEquals(0.4f, factory.live(FIREFOX).gain);
+        assertTrue(factory.liveOn(firefox, HEADPHONES));
+        assertEquals(0.4f, factory.live(firefox).gain);
         assertEquals(1, factory.liveCount());
     }
 
     @Test
     void aDialChangeDuringAMoveEndsOnTheNewOutputWithTheNewVolume() throws InterruptedException {
-        service.setVolume(FIREFOX, 0.3f);
-        service.setVolume(MUSIC, 0.6f);
+        service.setVolume(firefox, 0.3f);
+        service.setVolume(music, 0.6f);
         factory.block();
         coreAudio.defaultOutput = HEADPHONES;
         service.defaultOutputChanged();
         assertTrue(factory.entered.await(5, TimeUnit.SECONDS), "the move started");
 
-        var dial = Thread.ofPlatform().start(() -> service.setVolume(MUSIC, 0.2f));
+        var dial = Thread.ofPlatform().start(() -> service.setVolume(music, 0.2f));
         factory.release();
         dial.join(5_000);
 
-        await(() -> factory.liveOn(FIREFOX, HEADPHONES) && factory.liveOn(MUSIC, HEADPHONES));
+        await(() -> factory.liveOn(firefox, HEADPHONES) && factory.liveOn(music, HEADPHONES));
         assertEquals(2, factory.liveCount());
-        assertEquals(0.2f, factory.live(MUSIC).gain);
-        assertEquals(0.3f, factory.live(FIREFOX).gain);
+        assertEquals(0.2f, factory.live(music).gain);
+        assertEquals(0.3f, factory.live(firefox).gain);
     }
 
     @Test
     void shutdownDuringAMoveLeavesNoTapOpen() throws InterruptedException {
-        service.setVolume(FIREFOX, 0.3f);
-        service.setVolume(MUSIC, 0.6f);
+        service.setVolume(firefox, 0.3f);
+        service.setVolume(music, 0.6f);
         factory.block();
         coreAudio.defaultOutput = HEADPHONES;
         service.defaultOutputChanged();
@@ -346,8 +350,8 @@ class OsxProcessTapServiceTest {
     void nothingIsTappedAfterShutdown() {
         service.destroy();
 
-        service.setVolume(FIREFOX, 0.3f);
-        service.mute(MUSIC, MuteType.mute);
+        service.setVolume(firefox, 0.3f);
+        service.mute(music, MuteType.mute);
         service.defaultOutputChanged();
 
         assertTrue(factory.created.isEmpty());
@@ -355,9 +359,9 @@ class OsxProcessTapServiceTest {
 
     @Test
     void doesNothingWhereProcessTapsAreUnsupported() throws InterruptedException {
-        var unsupported = new OsxProcessTapService(coreAudio, factory, alive::contains, false, Duration.ofMillis(20));
+        var unsupported = new OsxProcessTapService(coreAudio, factory, false, Duration.ofMillis(20));
         try {
-            unsupported.setVolume(FIREFOX, 0.3f);
+            unsupported.setVolume(firefox, 0.3f);
             coreAudio.defaultOutput = HEADPHONES;
             unsupported.defaultOutputChanged();
             Thread.sleep(100);
@@ -427,8 +431,18 @@ class OsxProcessTapServiceTest {
         }
 
         @Override
+        public float gain() {
+            return gain;
+        }
+
+        @Override
         public void setMuted(boolean muted) {
             this.muted = muted;
+        }
+
+        @Override
+        public boolean muted() {
+            return muted;
         }
 
         @Override

@@ -88,6 +88,7 @@ final class ProcessTap implements Tap {
             }
 
             var result = new ProcessTap(tapId, aggregateId, initialGain, initialMuted);
+            log.debug("Starting process tap {} aggregate {} process object {} output '{}' initial gain {} muted {}", tapId, aggregateId, processObject, outputDeviceUid, initialGain, initialMuted);
             result.startRendering();
             return result;
         } catch (RuntimeException e) {
@@ -152,8 +153,18 @@ final class ProcessTap implements Tap {
     }
 
     @Override
+    public float gain() {
+        return gain;
+    }
+
+    @Override
     public void setMuted(boolean muted) {
         this.muted = muted;
+    }
+
+    @Override
+    public boolean muted() {
+        return muted;
     }
 
     /**
@@ -228,6 +239,7 @@ final class ProcessTap implements Tap {
             return;
         }
         closed = true;
+        log.debug("Closing process tap {} aggregate {} gain {} muted {}", tapId, aggregateId, gain, muted);
         var lib = CoreAudioTapLib.INSTANCE;
         logOnError(lib.AudioDeviceStop(aggregateId, ioProcId), "AudioDeviceStop");
         logOnError(lib.AudioDeviceDestroyIOProcID(aggregateId, ioProcId), "AudioDeviceDestroyIOProcID");
