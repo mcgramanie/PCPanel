@@ -211,19 +211,47 @@ class OsxProcessTapServiceTest {
     }
 
     @Test
-    void anAppMuteThatCouldNotBeMovedAnywhereIsRestoredForItsOwner() {
-        service.muteApplication(music, List.of(music), MuteType.mute);
+    void anAppWithNoOutputToTapKeepsItsStateUntilARetryTapsItAgain() {
+        service.setVolume(music, 0.6f);
+        service.mute(music, MuteType.mute);
         factory.failingUids.addAll(List.of(uid(SPEAKERS), uid(HEADPHONES)));
 
         coreAudio.defaultOutput = HEADPHONES;
-        service.migrateToDefaultOutput();
-        assertEquals(0, factory.liveCount(), "untapped while neither output takes a tap");
+        assertFalse(service.migrateToDefaultOutput());
+        assertEquals(0, factory.liveCount());
 
+        service.defaultOutputChanged();
         factory.failingUids.clear();
-        // What SndCtrlOsx does whenever it resolves the app's audio processes.
-        service.restoreApplicationMute(music, List.of(music));
-        assertTrue(factory.liveOn(music, HEADPHONES));
+        await(() -> factory.liveOn(music, HEADPHONES));
+        assertEquals(0.6f, factory.live(music).gain);
         assertTrue(factory.live(music).createdMuted);
+    }
+
+    @Test
+    void aHelperThatEndsWhileItsTapMovesGetsNoTap() throws Exception {
+        // A helper process (such as a WebKit audio process) of an app that keeps running: only the app is watched.
+        var helper = new ProcessBuilder(FakeProcess.command("idle")).start();
+        try {
+            var pid = (int) helper.pid();
+            service.setApplicationVolume(music, List.of(pid), 0.3f);
+            factory.beforeCreate = () -> {
+                helper.destroyForcibly();
+                try {
+                    helper.waitFor(5, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            };
+
+            coreAudio.defaultOutput = HEADPHONES;
+            service.migrateToDefaultOutput();
+
+            assertEquals(2, factory.created.stream().filter(t -> t.pid == pid).count(), "the move created a tap");
+            assertTrue(factory.created.stream().filter(t -> t.pid == pid).allMatch(t -> t.closed), "and closed it again");
+        } finally {
+            factory.beforeCreate = null;
+            helper.destroyForcibly();
+        }
     }
 
     @Test
@@ -458,6 +486,7 @@ class OsxProcessTapServiceTest {
         final Map<String, AtomicInteger> attempts = new ConcurrentHashMap<>();
         final CountDownLatch entered = new CountDownLatch(1);
         volatile @Nullable Thread blockedThread;
+        volatile @Nullable Runnable beforeCreate;
         private volatile CountDownLatch gate = new CountDownLatch(0);
 
         void block() {
@@ -470,6 +499,10 @@ class OsxProcessTapServiceTest {
 
         @Override
         public Tap create(int processObject, String outputDeviceUid, float initialGain, boolean initialMuted) {
+            var hook = beforeCreate;
+            if (hook != null) {
+                hook.run();
+            }
             if (gate.getCount() > 0) {
                 blockedThread = Thread.currentThread();
                 entered.countDown();

@@ -69,6 +69,44 @@ class OsxProcessTapService {
     private @Nullable ScheduledFuture<?> retry;
 
     private record Entry(Tap tap, int outputDeviceId, ProcessIdentity owner, int processObject) {
+        boolean detached() {
+            return tap instanceof DetachedTap;
+        }
+    }
+
+    /** Holds the wanted gain and mute of a process whose tap no output would take; renders nothing, retried on moves. */
+    private static final class DetachedTap implements Tap {
+        private volatile float gain;
+        private volatile boolean muted;
+
+        DetachedTap(float gain, boolean muted) {
+            this.gain = gain;
+            this.muted = muted;
+        }
+
+        @Override
+        public void setGain(float gain) {
+            this.gain = Math.clamp(gain, 0, 1);
+        }
+
+        @Override
+        public float gain() {
+            return gain;
+        }
+
+        @Override
+        public void setMuted(boolean muted) {
+            this.muted = muted;
+        }
+
+        @Override
+        public boolean muted() {
+            return muted;
+        }
+
+        @Override
+        public void close() {
+        }
     }
 
     /** What a tap for one process on one output needs, resolved before any existing tap is closed. */
@@ -275,7 +313,7 @@ class OsxProcessTapService {
             }
         }
         var output = wrapper.getDefaultDevice(true);
-        return taps.values().stream().allMatch(entry -> entry.outputDeviceId() == output);
+        return taps.values().stream().allMatch(entry -> !entry.detached() && entry.outputDeviceId() == output);
     }
 
     @PreDestroy
@@ -289,7 +327,7 @@ class OsxProcessTapService {
         }
     }
 
-    /** Apply the requested state directly when recreating a tap; a failed recreation leaves no live entry. */
+    /** Apply the requested state directly when recreating a tap; a failed first tap leaves no entry, a failed move keeps one. */
     private void update(ProcessIdentity identity, ProcessIdentity owner, float gain, boolean muted) {
         if (destroyed || !owner.equals(ProcessIdentity.find(owner.pid()))) {
             return;
@@ -335,33 +373,40 @@ class OsxProcessTapService {
      * A tap renders to the device that was default at creation; recreate it on the current default output.
      * Everything the new tap needs is resolved before the old one closes, and an unreadable default output or
      * target leaves the old tap in place. When the new tap cannot be created the previous output gets one back,
-     * so the app keeps its volume and mute while the move is retried; when that fails too the entry is dropped.
+     * and when that fails too the entry keeps the wanted gain and mute without a tap; either way the move is
+     * retried. A process or owner that ended while its tap was created gets no tap.
      *
      * @return the entry now in {@link #taps} for {@code identity}, or null when it was dropped
      */
     private @Nullable Entry moveIfStale(ProcessIdentity identity, Entry entry) {
         var output = wrapper.getDefaultDevice(true);
-        if (output == 0 || entry.outputDeviceId() == output) {
+        if (output == 0 || !entry.detached() && entry.outputDeviceId() == output) {
             return entry;
         }
         var target = resolve(identity.pid(), output);
         if (target == null) {
             return entry;
         }
-        var previous = resolve(identity.pid(), entry.outputDeviceId());
+        var previous = entry.detached() ? null : resolve(identity.pid(), entry.outputDeviceId());
         var gain = entry.tap().gain();
         var muted = entry.tap().muted();
         closeEntry(identity, entry, "output change");
         var moved = createEntry(identity, entry.owner(), target, gain, muted);
         if (moved == null && previous != null) {
             moved = createEntry(identity, entry.owner(), previous, gain, muted);
-            log.debug("Unable to move the tap of {} to output {}, {}", identity, output, moved == null ? "dropped" : "kept on its previous output");
+        }
+        if (moved != null && !(identity.equals(ProcessIdentity.find(identity.pid())) && entry.owner().equals(ProcessIdentity.find(entry.owner().pid())))) {
+            closeEntry(identity, moved, "process or owner changed during creation");
+            taps.remove(identity);
+            return null;
+        }
+        if (moved == null || moved.outputDeviceId() != output) {
+            log.debug("Unable to move the tap of {} to output {}, {}", identity, output, moved == null ? "untapped until a retry" : "kept on its previous output");
         }
         if (moved == null) {
-            taps.remove(identity);
-        } else {
-            taps.put(identity, moved);
+            moved = new Entry(new DetachedTap(gain, muted), entry.outputDeviceId(), entry.owner(), entry.processObject());
         }
+        taps.put(identity, moved);
         return moved;
     }
 
